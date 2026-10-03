@@ -18,7 +18,8 @@ local SQLite file plus a local folder, and the model key sits in a local `.env`.
 
 Enterprise-grade / production-grade deployment is **not done yet** — it is tracked as follow-up work:
 
-- [ ] user accounts, authentication and per-user data isolation
+- [x] anonymous browser sessions with isolated saves, progress, notes and interaction history
+- [ ] recoverable cross-device accounts and login authentication
 - [ ] request rate limiting and per-key quotas
 - [ ] server-side secret management (no key on disk or in the frontend process)
 - [ ] HTTPS behind a reverse proxy, plus a real ASGI deployment (workers, health checks, restarts)
@@ -263,7 +264,7 @@ else straight to FastAPI.
 | POST | `/api/videos/{id}/save` | Save it; call again to unsave |
 | GET | `/api/videos/{id}/content` | The downloaded local MP4 (supports Range) |
 | GET | `/api/videos/{id}/steps` | Fetch the steps. The first request kicks off a background breakdown |
-| POST | `/api/videos/{id}/steps/regenerate[?force=1]` | Re-break it down. Runs in the background and returns immediately; required `force=1` once there is progress |
+| POST | `/api/videos/{id}/steps/regenerate[?force=1]` | Re-break it down in the background; requires `force=1` once there is progress and refuses in-place rebuilds shared by multiple users |
 | GET | `/api/videos/{id}/steps/{step_id}/frame` | This step's representative frame (JPEG) |
 | PATCH | `/api/videos/{id}/steps/{step_id}` | Tick "I did it" / leave a note |
 | POST | `/api/videos/{id}/steps/{step_id}/check` | Check whether this step passes |
@@ -285,12 +286,20 @@ Generate a public domain, set the health-check path to `/health`, and mount a Ra
 `/data` to preserve SQLite, downloaded videos and representative frames across restarts. Never put
 API keys or exported YouTube cookies in the repository.
 
+The first release identifies a browser with an HttpOnly `slowly_session` cookie. It lasts 180 days
+by default (`ANONYMOUS_SESSION_DAYS` can change it): the browser holds a random token while the
+database stores only its SHA-256 digest. Video files, breakdowns and search caches remain reusable;
+`user_tutorials`, `user_step_progress` and interactions carrying `user_id` isolate private state.
+Clearing browser data or changing devices creates a new anonymous user; account recovery is not yet
+available.
+
 ## Phone / PWA
 
 The frontend is also a PWA: on a phone, "Add to Home Screen" / "Install app" and it opens full
 screen with its own icon (see `frontend/README.md`). To reach it from a phone on the same network,
-set `HOST=0.0.0.0` in `.env` first — the startup log then prints the LAN URLs. The demo has no
-login, so prefer a personal hotspot over a shared Wi-Fi and set it back afterwards.
+set `HOST=0.0.0.0` in `.env` first — the startup log then prints the LAN URLs. The demo has no formal
+login: anonymous cookies isolate private browser state, but anyone on the same Wi-Fi can still use
+your backend and model allowance. Prefer a personal hotspot over a shared Wi-Fi.
 
 For a step-by-step setup, startup, phone-access and tear-down checklist — including the Windows
 firewall rule, the macOS local-network prompt and the "Wi-Fi client isolation" trap — see
@@ -312,8 +321,9 @@ where the segment boundary and the text each came from. Search, download and ste
 failures honestly — a failure is never dressed up as "nothing found". Free models may be
 rate-limited.
 
-Both services bind to localhost only; add user authentication, request limits and server-side secret
-management before deploying publicly.
+Both services bind to localhost only. Anonymous sessions isolate personal data but are not login
+authentication; add request limits, recoverable accounts and stronger server-side secret management
+before a public launch.
 
 For local YouTube downloads, explicitly authorize Chrome login access and set `YT_DLP_COOKIE_BROWSER=chrome`
 in the local `.env`. macOS may request Keychain approval. This is opt-in, applies only to YouTube

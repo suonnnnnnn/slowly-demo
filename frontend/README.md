@@ -40,9 +40,10 @@ time's. Navigations are network-first with a cached fallback, so the pages still
 drops mid-demo. If you touch anything in `SHELL_ASSETS`, bump `VERSION` in `sw.js`.
 
 To open it on a phone over your local network, set `HOST=0.0.0.0` in `.env` and restart; the
-startup log prints the LAN URLs. This demo has no login, so anyone on the same Wi-Fi can use your
-backend and your model key — prefer a personal hotspot over a shared network, and set it back when
-done.
+startup log prints the LAN URLs. This demo has no formal login. Each browser receives an HttpOnly
+anonymous cookie, so saves, progress, notes and interactions are isolated; anyone on the same Wi-Fi
+can still use your backend and model allowance. Prefer a personal hotspot over a shared network.
+Clearing browser data or changing devices creates a new anonymous user.
 
 ## The four pages
 
@@ -56,6 +57,8 @@ done.
 ## What works today
 
 - Chat home; tapping a suggested question sends it.
+- Each browser gets an anonymous identity. Videos and breakdowns can be reused, while saves, the
+  library, progress, notes and check/Q&A history are isolated per anonymous user.
 - Chinese/English mode persists across Home, video, steps, the material library and the shared navigation.
 - A shared two-tab bottom navigation keeps Home and Material Library one tap away on every page. The library only lists tutorials whose latest real
   breakdown succeeded; failed generic skeletons are not presented as completed material. The default
@@ -75,13 +78,14 @@ done.
     do / unclear against the criterion, and a pass is recorded automatically); "ask when stuck".
   - "Save" / "Saved". Once saved, a "saved to do slowly" entry shows up on the home page, and the
     list shows progress such as "3 / 10 steps done".
-  - "Re-break it down" is one tap: it runs in the background and returns immediately while the page
-    polls for progress. The button turns red as a warning when there is progress, but there is no
-    second confirmation.
+  - "Re-break it down" is one tap when only the current anonymous user uses that tutorial: it runs
+    in the background while the page polls. If multiple users reference the same shared video, the
+    backend refuses an in-place rebuild so one person cannot replace everyone else's shared steps.
   - The step strip is scrollable on desktop too (the wheel scrolls it horizontally, and you can drag
     it).
-  - Steps and progress live in the backend's SQLite (`tutorial_steps` / `step_interactions`), so a
-    refresh loses nothing.
+  - Shared steps live in `tutorial_steps`; private state lives in `user_step_progress`,
+    `user_tutorials` and `step_interactions` carrying `user_id`, so refreshes lose nothing and a
+    different browser cannot see it.
   - The breakdown is **real**: `backend/app/video_analysis.py` uses ffmpeg to find scene cuts and
     grab representative frames, then `breakdown.py` sends each segment to a vision model to write
     the title / description / pass criterion. The model sees one screenshot per segment, hears no
@@ -107,5 +111,6 @@ watched the video either — it only has the pass criterion, your description an
 Please only save public videos you are allowed to download. Free models may be rate-limited.
 
 This is a local demo, not a production deployment — see "Scope: a local demo, not a production
-deployment" in the root README for the follow-up work. The service binds to localhost only; add user
-authentication, request limits and server-side secret management before deploying publicly.
+deployment" in the root README for the follow-up work. Anonymous sessions isolate data but provide
+no account recovery; add request limits, real accounts and stronger server-side secret management
+before a public launch.

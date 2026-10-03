@@ -1,4 +1,5 @@
 const http = require("node:http");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -25,6 +26,24 @@ const host = process.env.HOST || "127.0.0.1";
 const modelApiBase = (process.env.MODEL_API_BASE || "https://openrouter.ai/api/v1").replace(/\/+$/, "");
 const modelApiKey = process.env.MODEL_API_KEY || process.env.OPENROUTER_API_KEY || "";
 const modelName = process.env.MODEL_NAME || "inclusionai/ling-3.0-flash-sante:free";
+const sessionCookieName = "slowly_session";
+const sessionCookieDays = Number.parseInt(process.env.ANONYMOUS_SESSION_DAYS || "180", 10);
+
+function ensureAnonymousCookie(req, res) {
+  const cookies = Object.fromEntries((req.headers.cookie || "").split(";").map((part) => {
+    const at = part.indexOf("=");
+    return at < 0 ? ["", ""] : [part.slice(0, at).trim(), part.slice(at + 1).trim()];
+  }));
+  let token = cookies[sessionCookieName];
+  if (!/^[A-Za-z0-9_-]{32,128}$/.test(token || "")) {
+    token = crypto.randomBytes(32).toString("base64url");
+    const secure = String(req.headers["x-forwarded-proto"] || "").split(",", 1)[0] === "https";
+    const maxAge = Math.max(1, sessionCookieDays) * 24 * 60 * 60;
+    res.setHeader("Set-Cookie", `${sessionCookieName}=${token}; Max-Age=${maxAge}; Path=/; HttpOnly; SameSite=Lax${secure ? "; Secure" : ""}`);
+    req.headers.cookie = `${sessionCookieName}=${token}`;
+  }
+  return token;
+}
 
 function requestIsSameOrigin(req) {
   if (!req.headers.origin) return true;
@@ -64,7 +83,12 @@ async function proxyJson(res, apiPath, options = {}) {
   try {
     const upstream = await fetch(`${videoBackendUrl}${apiPath}`, {
       ...init,
-      headers: { Accept: "application/json", ...(init.headers || {}) },
+      headers: {
+        Accept: "application/json",
+        Cookie: res.req.headers.cookie || "",
+        "X-Forwarded-Proto": res.req.headers["x-forwarded-proto"] || "http",
+        ...(init.headers || {}),
+      },
       signal: AbortSignal.timeout(timeoutMs),
     });
     const body = await upstream.text();
@@ -83,7 +107,12 @@ async function proxyJson(res, apiPath, options = {}) {
 
 async function proxyBinary(res, apiPath) {
   try {
-    const upstream = await fetch(`${videoBackendUrl}${apiPath}`);
+    const upstream = await fetch(`${videoBackendUrl}${apiPath}`, {
+      headers: {
+        Cookie: res.req.headers.cookie || "",
+        "X-Forwarded-Proto": res.req.headers["x-forwarded-proto"] || "http",
+      },
+    });
     const headers = { "Cache-Control": "private, max-age=3600" };
     for (const name of ["content-type", "content-length"]) {
       const value = upstream.headers.get(name);
@@ -100,7 +129,10 @@ async function proxyBinary(res, apiPath) {
 
 async function proxyVideoContent(req, res, videoId) {
   try {
-    const headers = {};
+    const headers = {
+      Cookie: req.headers.cookie || "",
+      "X-Forwarded-Proto": req.headers["x-forwarded-proto"] || "http",
+    };
     if (req.headers.range) headers.Range = req.headers.range;
     const upstream = await fetch(`${videoBackendUrl}/api/videos/${videoId}/content`, { headers });
     const responseHeaders = { "Cache-Control": "private, max-age=3600" };
@@ -242,6 +274,7 @@ const reply = (res, status, data) => {
 };
 
 http.createServer(async (req, res) => {
+  ensureAnonymousCookie(req, res);
   const lang = langOf(req);
   const pathname = req.url.split("?")[0];
   // 部署健康检查走完整链路：Node 能响应、FastAPI 与 SQLite 也都正常才算就绪。
@@ -272,7 +305,7 @@ http.createServer(async (req, res) => {
       busy = true;
       const [modelResult, searchResult] = await Promise.all([
         requestModel(messages, lang),
-        searchYoutubeForChat(messages),
+        searchYoutubeForChat(messages, { cookie: req.headers.cookie || "" }),
       ]);
       return reply(res, 200, {
         message: modelResult.message,

@@ -15,7 +15,8 @@
 
 企业级 / 生产级部署**还没做**，属于待办（TODO），后续会继续完成：
 
-- [ ] 用户账号、登录鉴权与用户间数据隔离
+- [x] 匿名浏览器会话与用户间收藏、进度、备注、互动记录隔离
+- [ ] 可跨设备恢复的正式账号与登录鉴权
 - [ ] 请求限流与按 key 的配额
 - [ ] 服务端密钥管理（不再落盘、不放在前端进程里）
 - [ ] 反向代理 + HTTPS，以及真正的 ASGI 部署（多 worker、健康检查、自动重启）
@@ -247,7 +248,7 @@ MODEL_NAME=你的模型名                # 步骤判定要用能看图的模型
 | POST | `/api/videos/{id}/save` | 「存下来」；再调一次取消 |
 | GET | `/api/videos/{id}/content` | 下载好的本地 MP4（支持 Range） |
 | GET | `/api/videos/{id}/steps` | 拿步骤。首次访问会起一个后台分解 |
-| POST | `/api/videos/{id}/steps/regenerate[?force=1]` | 重新分解。后台跑、立刻返回；已有进度时必须带 `force=1` |
+| POST | `/api/videos/{id}/steps/regenerate[?force=1]` | 重新分解。后台跑、立刻返回；已有进度时必须带 `force=1`；多位用户共享时拒绝原地重拆 |
 | GET | `/api/videos/{id}/steps/{step_id}/frame` | 这一步的代表画面（JPEG） |
 | PATCH | `/api/videos/{id}/steps/{step_id}` | 勾「我做到了」/ 留备注 |
 | POST | `/api/videos/{id}/steps/{step_id}/check` | 判定这一步过没过 |
@@ -269,12 +270,18 @@ FFmpeg。Railway 会自动识别它。需要在服务变量中配置：
 这样 SQLite、下载视频和代表画面在重启后仍会保留。不要把 API 密钥或导出的 YouTube Cookie
 提交到仓库。
 
+第一版用户身份使用 `slowly_session` HttpOnly Cookie，有效期默认 180 天（可用
+`ANONYMOUS_SESSION_DAYS` 调整）。浏览器只持有随机令牌，数据库只保存 SHA-256 哈希；视频文件、
+分解结果和搜索缓存可以复用，`user_tutorials`、`user_step_progress` 与带 `user_id` 的互动记录按用户隔离。
+清除浏览器数据或换设备会成为一个新匿名用户，目前没有账号恢复能力。
+
 ## 手机 / PWA
 
 前端同时也是一个 PWA：手机上「添加到主屏幕」/「安装应用」即可全屏打开、有自己的图标
 （见 `frontend/README.zh-CN.md`）。想在同一网络下的手机上打开，先把 `.env` 里的
-`HOST` 设成 `0.0.0.0`，启动日志会打印局域网地址。这个 demo 没有登录，
-建议用自己的手机热点而不是公共 WiFi，用完改回来。
+`HOST` 设成 `0.0.0.0`，启动日志会打印局域网地址。这个 demo 没有正式登录；匿名 Cookie 会隔离
+每台浏览器的私人状态，但同一 WiFi 的人仍能使用你的后端和模型额度，建议用自己的手机热点而不是
+公共 WiFi，用完改回来。
 
 从环境搭建、启动、手机访问到演示收尾的完整清单（含 Windows 防火墙规则、macOS 本地网络权限，
 以及「WiFi 客户端隔离」这个最常见的坑），见 [`docs/demo-runbook.zh-CN.md`](docs/demo-runbook.zh-CN.md)。
@@ -289,7 +296,8 @@ FFmpeg。Railway 会自动识别它。需要在服务变量中配置：
 判定模型同样没看过视频，只依据合格标准、你的描述和可选的照片。界面上每一步都标了这一段的边界和文字各是从哪来的。
 检索、下载和判定都会如实报告失败，不会把失败说成“没搜到”。免费模型可能受限流影响。
 
-两个服务都只监听本机地址；部署为公开服务前需添加用户认证、请求限额及服务端密钥管理。
+两个服务都只监听本机地址。匿名会话已经隔离个人数据，但不是登录认证；公开服务仍需补请求限额、
+正式账号恢复能力及更完整的服务端密钥管理。
 
 本地下载 YouTube 时，经用户明确授权后可在 `.env` 设置 `YT_DLP_COOKIE_BROWSER=chrome`，读取 Chrome 登录状态。
 macOS 可能请求钥匙串授权。仅对 YouTube 链接启用，默认关闭；`YT_DLP_COOKIE_FILE` 优先。不要提交浏览器凭证。

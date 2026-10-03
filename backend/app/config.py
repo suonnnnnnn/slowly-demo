@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./data/cookclip.db"
     local_storage_root: Path = Path("./data/storage")
     local_workers: int = 2
+    anonymous_session_days: int = 180
     # 整个检索子进程的总预算（秒）。要容得下 Python 启动 + import yt-dlp + 联网，
     # 8 秒在健康网络下都很紧（光 import 就要 1~2 秒）。
     search_timeout_seconds: int = 25

@@ -6,6 +6,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     Float,
+    ForeignKey,
     Integer,
     String,
     Text,
@@ -42,8 +43,6 @@ class Video(Base):
     file_size: Mapped[int | None] = mapped_column(BigInteger)
     mime_type: Mapped[str | None] = mapped_column(String(128))
 
-    # 用户点「存下来」的时间。空 = 没存。
-    saved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # 素材库分类。model=免费模型按标题与截图步骤判断；rule=标题关键词兜底。
     library_category: Mapped[str | None] = mapped_column(String(16))
     library_category_basis: Mapped[str | None] = mapped_column(String(16))
@@ -51,9 +50,47 @@ class Video(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
-    @property
-    def saved(self) -> bool:
-        return self.saved_at is not None
+
+class User(Base):
+    """Anonymous today, ready to be upgraded to a real account later."""
+
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, default="anonymous")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AnonymousSession(Base):
+    """Only a SHA-256 digest is stored; the browser owns the bearer token."""
+
+    __tablename__ = "anonymous_sessions"
+
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class UserTutorial(Base):
+    """A user's private relationship with a shared video/tutorial."""
+
+    __tablename__ = "user_tutorials"
+    __table_args__ = (
+        UniqueConstraint("user_id", "video_id", name="uq_user_tutorial_user_video"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    video_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("videos.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    saved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class SearchCache(Base):
@@ -152,15 +189,6 @@ class TutorialStep(Base):
     # 这一段的代表帧，相对 local_storage_root 的路径
     frame_key: Mapped[str | None] = mapped_column(Text)
 
-    done: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    done_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    user_note: Mapped[str | None] = mapped_column(Text)
-
-    # 最近一次「让小慢看看」的结果，冗余存一份，省得每次列表都去 join 历史表
-    last_verdict: Mapped[str | None] = mapped_column(String(16))
-    last_reason: Mapped[str | None] = mapped_column(Text)
-    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -175,8 +203,15 @@ class StepInteraction(Base):
     __tablename__ = "step_interactions"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    video_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
-    step_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    video_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("videos.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    step_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tutorial_steps.id", ondelete="CASCADE"), nullable=False, index=True
+    )
 
     kind: Mapped[str] = mapped_column(String(16), nullable=False)  # check | ask
     user_input: Mapped[str | None] = mapped_column(Text)
@@ -189,3 +224,31 @@ class StepInteraction(Base):
     model_name: Mapped[str | None] = mapped_column(String(160))
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class UserStepProgress(Base):
+    """Private progress layered over a shared tutorial step."""
+
+    __tablename__ = "user_step_progress"
+    __table_args__ = (
+        UniqueConstraint("user_id", "step_id", name="uq_user_step_progress_user_step"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    video_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("videos.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    step_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tutorial_steps.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    done: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    done_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    user_note: Mapped[str | None] = mapped_column(Text)
+    last_verdict: Mapped[str | None] = mapped_column(String(16))
+    last_reason: Mapped[str | None] = mapped_column(Text)
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)

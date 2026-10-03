@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from app import breakdown as breakdown_module
 from app import translate as translate_module
 from app import video_analysis
+from app.auth import current_user_id
 from app.breakdown import build_steps, mock_note
 from app.coach import ask_step, check_step
 from app.config import settings
@@ -24,7 +25,15 @@ from app.database import SessionLocal, create_tables, get_db, session_scope
 from app.i18n import msg, normalize
 from app.local_queue import executor, submit
 from app.library import CATEGORY_LABELS, classify_tutorials, display_tutorial_title, keyword_category
-from app.models import StepInteraction, TutorialBreakdown, TutorialStep, Video, utcnow
+from app.models import (
+    StepInteraction,
+    TutorialBreakdown,
+    TutorialStep,
+    UserStepProgress,
+    UserTutorial,
+    Video,
+    utcnow,
+)
 from app.schemas import (
     PlaybackRead,
     LibraryItem,
@@ -111,6 +120,47 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
 
 
+def _user_tutorial(user_id: str, video_id: str, db: Session) -> UserTutorial | None:
+    return db.scalar(
+        select(UserTutorial).where(
+            UserTutorial.user_id == user_id,
+            UserTutorial.video_id == video_id,
+        )
+    )
+
+
+def _ensure_user_tutorial(user_id: str, video_id: str, db: Session) -> UserTutorial:
+    link = _user_tutorial(user_id, video_id, db)
+    if link is None:
+        link = UserTutorial(user_id=user_id, video_id=video_id)
+        db.add(link)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            link = _user_tutorial(user_id, video_id, db)
+            if link is None:
+                raise
+    return link
+
+
+def _require_user_tutorial(user_id: str, video_id: str, db: Session) -> UserTutorial:
+    link = _user_tutorial(user_id, video_id, db)
+    if link is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return link
+
+
+def _video_read(video: Video, link: UserTutorial | None) -> VideoRead:
+    data = {
+        column: getattr(video, column)
+        for column in VideoRead.model_fields
+        if column != "saved"
+    }
+    data["saved"] = bool(link and link.saved_at)
+    return VideoRead(**data)
+
+
 def _submit_download(video: Video, db: Session) -> None:
     try:
         submit(download_video, video.id)
@@ -149,7 +199,11 @@ def health(db: Session = Depends(get_db)):
 
 
 @app.post("/api/videos", response_model=VideoRead, status_code=status.HTTP_202_ACCEPTED)
-def create_video(payload: VideoCreate, db: Session = Depends(get_db)):
+def create_video(
+    payload: VideoCreate,
+    user_id: str = Depends(current_user_id),
+    db: Session = Depends(get_db),
+):
     source_url = str(payload.url)
     try:
         validate_source_url(source_url, settings.allowed_domains)
@@ -167,7 +221,8 @@ def create_video(payload: VideoCreate, db: Session = Depends(get_db)):
     if existing is None:
         existing = db.scalar(select(Video).where(Video.source_url == source_url))
     if existing is not None:
-        return _reuse_video(existing, payload, db)
+        video = _reuse_video(existing, payload, db)
+        return _video_read(video, _ensure_user_tutorial(user_id, video.id, db))
 
     video = Video(
         source_url=source_url,
@@ -193,17 +248,19 @@ def create_video(payload: VideoCreate, db: Session = Depends(get_db)):
                 )
             )
         if existing is not None:
-            return _reuse_video(existing, payload, db)
+            video = _reuse_video(existing, payload, db)
+            return _video_read(video, _ensure_user_tutorial(user_id, video.id, db))
         raise
     db.refresh(video)
-
+    link = _ensure_user_tutorial(user_id, video.id, db)
     _submit_download(video, db)
-    return video
+    return _video_read(video, link)
 
 
 @app.get("/api/search", response_model=SearchResponse)
 def search_videos(
     q: str = Query(min_length=1, max_length=50),
+    user_id: str = Depends(current_user_id),
     db: Session = Depends(get_db),
 ):
     query = q.strip()
@@ -226,10 +283,13 @@ def search_videos(
     if candidate_ids:
         saved_ids = set(
             db.scalars(
-                select(Video.source_video_id).where(
+                select(Video.source_video_id)
+                .join(UserTutorial, UserTutorial.video_id == Video.id)
+                .where(
+                    UserTutorial.user_id == user_id,
+                    UserTutorial.saved_at.is_not(None),
                     func.lower(Video.source_platform) == "youtube",
                     Video.source_video_id.in_(candidate_ids),
-                    Video.status != "failed",
                 )
             ).all()
         )
@@ -239,35 +299,58 @@ def search_videos(
 
 
 @app.get("/api/videos", response_model=list[VideoRead])
-def list_videos(saved: bool | None = Query(default=None), db: Session = Depends(get_db)):
+def list_videos(
+    saved: bool | None = Query(default=None),
+    user_id: str = Depends(current_user_id),
+    db: Session = Depends(get_db),
+):
     """任务列表。带 saved=1 就只看存下来的教程。"""
-    query = select(Video).order_by(Video.created_at.desc()).limit(50)
+    query = (
+        select(Video, UserTutorial)
+        .join(UserTutorial, UserTutorial.video_id == Video.id)
+        .where(UserTutorial.user_id == user_id)
+        .order_by(UserTutorial.created_at.desc())
+        .limit(50)
+    )
     if saved is not None:
-        query = query.where(Video.saved_at.is_not(None) if saved else Video.saved_at.is_(None))
-    return db.scalars(query).all()
+        query = query.where(
+            UserTutorial.saved_at.is_not(None) if saved else UserTutorial.saved_at.is_(None)
+        )
+    return [_video_read(video, link) for video, link in db.execute(query).all()]
 
 
 @app.get("/api/saved-tutorials", response_model=list[SavedTutorial])
-def list_saved_tutorials(db: Session = Depends(get_db)):
+def list_saved_tutorials(
+    user_id: str = Depends(current_user_id),
+    db: Session = Depends(get_db),
+):
     """「存着慢慢做」列表：按存下时间倒序，带上做到第几步了。
 
     只看存下的，不掺别的——这个页面存在的意义就是「我打算回来做的那几个」。
     """
-    videos = db.scalars(
-        select(Video)
-        .where(Video.saved_at.is_not(None))
-        .order_by(Video.saved_at.desc())
+    rows = db.execute(
+        select(Video, UserTutorial)
+        .join(UserTutorial, UserTutorial.video_id == Video.id)
+        .where(UserTutorial.user_id == user_id, UserTutorial.saved_at.is_not(None))
+        .order_by(UserTutorial.saved_at.desc())
         .limit(50)
     ).all()
-    if not videos:
+    if not rows:
         return []
+    videos = [video for video, _ in rows]
+    links = {link.video_id: link for _, link in rows}
 
     counts: dict[str, tuple[int, int]] = {}
     rows = db.execute(
         select(
             TutorialStep.video_id,
             func.count(TutorialStep.id),
-            func.sum(case((TutorialStep.done.is_(True), 1), else_=0)),
+            func.sum(case((UserStepProgress.done.is_(True), 1), else_=0)),
+        )
+        .outerjoin(
+            UserStepProgress,
+            (UserStepProgress.step_id == TutorialStep.id)
+            & (UserStepProgress.user_id == user_id),
         )
         .where(TutorialStep.video_id.in_([video.id for video in videos]))
         .group_by(TutorialStep.video_id)
@@ -283,7 +366,7 @@ def list_saved_tutorials(db: Session = Depends(get_db)):
             duration_seconds=video.duration_seconds,
             thumbnail_url=video.thumbnail_url,
             status=video.status,
-            saved_at=video.saved_at,
+            saved_at=links[video.id].saved_at,
             step_total=counts.get(video.id, (0, 0))[0],
             step_done=counts.get(video.id, (0, 0))[1],
         )
@@ -292,12 +375,16 @@ def list_saved_tutorials(db: Session = Depends(get_db)):
 
 
 @app.get("/api/library", response_model=list[LibraryItem])
-def list_library(db: Session = Depends(get_db)):
+def list_library(
+    user_id: str = Depends(current_user_id),
+    db: Session = Depends(get_db),
+):
     """已经完成真实分解的素材；最新分解失败或只有通用骨架时不展示。"""
     videos = db.scalars(
         select(Video)
-        .where(Video.status == "ready")
-        .order_by(Video.updated_at.desc())
+        .join(UserTutorial, UserTutorial.video_id == Video.id)
+        .where(UserTutorial.user_id == user_id, Video.status == "ready")
+        .order_by(UserTutorial.created_at.desc())
         .limit(100)
     ).all()
     if not videos:
@@ -318,7 +405,12 @@ def list_library(db: Session = Depends(get_db)):
             select(
                 TutorialStep.video_id,
                 func.count(TutorialStep.id),
-                func.sum(case((TutorialStep.done.is_(True), 1), else_=0)),
+                func.sum(case((UserStepProgress.done.is_(True), 1), else_=0)),
+            )
+            .outerjoin(
+                UserStepProgress,
+                (UserStepProgress.step_id == TutorialStep.id)
+                & (UserStepProgress.user_id == user_id),
             )
             .where(TutorialStep.video_id.in_(video_ids))
             .group_by(TutorialStep.video_id)
@@ -382,28 +474,42 @@ def list_library(db: Session = Depends(get_db)):
 
 
 @app.post("/api/videos/{video_id}/save", response_model=VideoRead)
-def toggle_save_video(video_id: str, db: Session = Depends(get_db)):
+def toggle_save_video(
+    video_id: str,
+    user_id: str = Depends(current_user_id),
+    db: Session = Depends(get_db),
+):
     """「存下来，慢慢做」：再点一次就是取消。进度和步骤本来就都在库里，
     这个标记的意思是「我以后还想做它」，方便之后按「存下的教程」列出来。"""
     video = _load_video(video_id, db)
-    video.saved_at = None if video.saved_at else utcnow()
+    link = _require_user_tutorial(user_id, video_id, db)
+    link.saved_at = None if link.saved_at else utcnow()
     db.commit()
-    db.refresh(video)
-    return video
+    db.refresh(link)
+    return _video_read(video, link)
 
 
 @app.get("/api/videos/{video_id}", response_model=VideoRead)
-def get_video(video_id: str, db: Session = Depends(get_db)):
+def get_video(
+    video_id: str,
+    user_id: str = Depends(current_user_id),
+    db: Session = Depends(get_db),
+):
     video = db.get(Video, video_id)
-    if video is None:
+    link = _user_tutorial(user_id, video_id, db)
+    if video is None or link is None:
         raise HTTPException(status_code=404, detail="任务不存在")
-    return video
+    return _video_read(video, link)
 
 
 @app.get("/api/videos/{video_id}/playback", response_model=PlaybackRead)
-def get_playback(video_id: str, db: Session = Depends(get_db)):
+def get_playback(
+    video_id: str,
+    user_id: str = Depends(current_user_id),
+    db: Session = Depends(get_db),
+):
     video = db.get(Video, video_id)
-    if video is None:
+    if video is None or _user_tutorial(user_id, video_id, db) is None:
         raise HTTPException(status_code=404, detail="任务不存在")
     if video.status != "ready" or not video.object_key:
         raise HTTPException(status_code=409, detail="视频尚未准备完成")
@@ -411,14 +517,17 @@ def get_playback(video_id: str, db: Session = Depends(get_db)):
 
 
 @app.get("/api/videos/{video_id}/content")
-def get_video_content(video_id: str):
+def get_video_content(
+    video_id: str,
+    user_id: str = Depends(current_user_id),
+):
     # 故意不用 Depends(get_db)：FileResponse 传大文件期间响应一直没结束，
     # 而 yield 式依赖要等响应发完才回收连接。播放时并发十几个分片请求，
     # 会把连接池占满、拖垮其它接口（素材库打不开就是这个原因）。
     # 这里读完要用的字段就立刻关会话。
     with session_scope() as db:
         video = db.get(Video, video_id)
-        if video is None:
+        if video is None or _user_tutorial(user_id, video_id, db) is None:
             raise HTTPException(status_code=404, detail="任务不存在")
         if video.status != "ready" or not video.object_key:
             raise HTTPException(status_code=409, detail="视频尚未准备完成")
@@ -438,11 +547,39 @@ def get_video_content(video_id: str):
 
 
 @app.delete("/api/videos/{video_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_video(video_id: str, db: Session = Depends(get_db)):
+def delete_video(
+    video_id: str,
+    user_id: str = Depends(current_user_id),
+    db: Session = Depends(get_db),
+):
     video = db.get(Video, video_id)
-    if video is None:
+    link = _user_tutorial(user_id, video_id, db)
+    if video is None or link is None:
         raise HTTPException(status_code=404, detail="任务不存在")
+
+    for progress in db.scalars(
+        select(UserStepProgress).where(
+            UserStepProgress.user_id == user_id,
+            UserStepProgress.video_id == video_id,
+        )
+    ).all():
+        db.delete(progress)
+    for interaction in db.scalars(
+        select(StepInteraction).where(
+            StepInteraction.user_id == user_id,
+            StepInteraction.video_id == video_id,
+        )
+    ).all():
+        db.delete(interaction)
+    db.delete(link)
+    db.flush()
+
+    if db.scalar(select(func.count(UserTutorial.id)).where(UserTutorial.video_id == video_id)):
+        db.commit()
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
     if video.status not in {"ready", "failed"}:
+        db.rollback()
         raise HTTPException(status_code=409, detail="视频仍在处理中，请完成后再删除")
 
     if video.object_key:
@@ -458,6 +595,10 @@ def delete_video(video_id: str, db: Session = Depends(get_db)):
         select(StepInteraction).where(StepInteraction.video_id == video_id)
     ).all():
         db.delete(interaction)
+    for progress in db.scalars(
+        select(UserStepProgress).where(UserStepProgress.video_id == video_id)
+    ).all():
+        db.delete(progress)
     for record in db.scalars(
         select(TutorialBreakdown).where(TutorialBreakdown.video_id == video_id)
     ).all():
@@ -597,7 +738,14 @@ def build_breakdown(video_id: str, *, force: bool = False, lang: str = "zh") -> 
             session.flush()  # 拿到 record.id，代表帧要按它分目录
 
             # 旧的步骤和它们的判定历史一起清掉：位置都换了，留着只会对不上
-            for step in _ordered_steps(video_id, session):
+            old_steps = _ordered_steps(video_id, session)
+            old_step_ids = [step.id for step in old_steps]
+            if old_step_ids:
+                for progress in session.scalars(
+                    select(UserStepProgress).where(UserStepProgress.step_id.in_(old_step_ids))
+                ).all():
+                    session.delete(progress)
+            for step in old_steps:
                 session.delete(step)
             for interaction in session.scalars(
                 select(StepInteraction).where(StepInteraction.video_id == video_id)
@@ -737,21 +885,95 @@ def _ensure_english_steps(steps: list[TutorialStep], db: Session) -> bool:
     return all(_step_is_translated(step) for step in steps)
 
 
-def _step_read(step: TutorialStep, lang: str, record_lang: str = "zh") -> StepRead:
+def _progress_map(
+    user_id: str,
+    steps: list[TutorialStep],
+    db: Session,
+) -> dict[str, UserStepProgress]:
+    if not steps:
+        return {}
+    return {
+        progress.step_id: progress
+        for progress in db.scalars(
+            select(UserStepProgress).where(
+                UserStepProgress.user_id == user_id,
+                UserStepProgress.step_id.in_([step.id for step in steps]),
+            )
+        ).all()
+    }
+
+
+def _get_or_create_progress(
+    user_id: str,
+    step: TutorialStep,
+    db: Session,
+) -> UserStepProgress:
+    progress = db.scalar(
+        select(UserStepProgress).where(
+            UserStepProgress.user_id == user_id,
+            UserStepProgress.step_id == step.id,
+        )
+    )
+    if progress is None:
+        progress = UserStepProgress(
+            user_id=user_id,
+            video_id=step.video_id,
+            step_id=step.id,
+        )
+        db.add(progress)
+        try:
+            db.flush()
+        except IntegrityError:
+            db.rollback()
+            progress = db.scalar(
+                select(UserStepProgress).where(
+                    UserStepProgress.user_id == user_id,
+                    UserStepProgress.step_id == step.id,
+                )
+            )
+            if progress is None:
+                raise
+    return progress
+
+
+def _step_read(
+    step: TutorialStep,
+    progress: UserStepProgress | None,
+    lang: str,
+    record_lang: str = "zh",
+) -> StepRead:
     """按请求语言出文案。
 
     落库列存的是「生成原文」（record.lang 记它是哪种语言）：
     - 请求语言 == 生成语言 → 直接用原文，一个字都不动；
     - 请求 en、原文 zh → en_* 列翻好了就覆盖，没翻好原样中文（不假装）。
     """
+    data = {
+        "id": step.id,
+        "position": step.position,
+        "title": step.title,
+        "summary": step.summary,
+        "question": step.question,
+        "criteria": step.criteria,
+        "hint": step.hint,
+        "start_seconds": step.start_seconds,
+        "end_seconds": step.end_seconds,
+        "basis": step.basis,
+        "text_basis": step.text_basis,
+        "has_frame": step.has_frame,
+        "done": bool(progress and progress.done),
+        "done_at": progress.done_at if progress else None,
+        "user_note": progress.user_note if progress else None,
+        "last_verdict": progress.last_verdict if progress else None,
+        "last_reason": progress.last_reason if progress else None,
+        "last_checked_at": progress.last_checked_at if progress else None,
+    }
     if normalize(lang) == "en" and record_lang == "zh" and _step_is_translated(step):
-        data = StepRead.model_validate(step).model_dump()
         for en_field, zh_field in _EN_STEP_FIELDS:
             value = getattr(step, en_field)
             if value is not None:
                 data[zh_field] = value
-        return StepRead(**data)
-    return StepRead.model_validate(step)
+    return StepRead(**data)
 
 
 def _steps_response(
@@ -759,6 +981,7 @@ def _steps_response(
     steps: list[TutorialStep],
     record: TutorialBreakdown | None,
     *,
+    progress: dict[str, UserStepProgress],
     analyzing: bool,
     waiting: bool,
     lang: str = "zh",
@@ -796,7 +1019,7 @@ def _steps_response(
         video_id=video.id,
         title=video.title,
         total=len(steps),
-        done_count=sum(1 for step in steps if step.done),
+        done_count=sum(1 for step in steps if progress.get(step.id) and progress[step.id].done),
         # 只有整份步骤都是骨架时才算 mock。混着的时候一律按真的说，界面上每步自己会标。
         mock=bool(steps) and all(step.basis == breakdown_module.MOCK_BASIS for step in steps),
         vision_ready=settings.model_vision_enabled and bool(settings.model_key),
@@ -805,7 +1028,7 @@ def _steps_response(
         basis=record.method if record else None,
         frame_count=sum(1 for step in steps if step.frame_key),
         note=note,
-        steps=[_step_read(step, lang, record_lang) for step in steps],
+        steps=[_step_read(step, progress.get(step.id), lang, record_lang) for step in steps],
     )
 
 
@@ -826,6 +1049,7 @@ def _validate_image(image_data_url: str | None, lang: str = "zh") -> str | None:
 def get_video_steps(
     video_id: str,
     lang: str = Query(default="zh"),
+    user_id: str = Depends(current_user_id),
     db: Session = Depends(get_db),
 ):
     """拿到这条视频的步骤。
@@ -834,13 +1058,16 @@ def get_video_steps(
     前端轮询等它变成 false 即可——不要在这里同步跑，不然页面会卡住半分钟。
     """
     video = _load_video(video_id, db, lang)
+    _require_user_tutorial(user_id, video_id, db)
     source = _local_video_path(video)
     ready = video.status == "ready" and source is not None
     record = _latest_breakdown(video_id, db)
 
     if not ready:
         # 还没下载完：不给假步骤，就说清楚在等什么
-        return _steps_response(video, [], record, analyzing=False, waiting=True, lang=lang)
+        return _steps_response(
+            video, [], record, progress={}, analyzing=False, waiting=True, lang=lang
+        )
 
     if _needs_analysis(video, record):
         _start_analysis(video_id, lang=lang)
@@ -849,6 +1076,7 @@ def get_video_steps(
     video = _load_video(video_id, db, lang)
     steps = _ordered_steps(video_id, db)
     record = _latest_breakdown(video_id, db)
+    progress = _progress_map(user_id, steps, db)
     if normalize(lang) == "en" and steps and (record is None or record.lang == "zh"):
         # 英文请求 + 中文生成的步骤：现翻一次并落库；英文生成的直接用原文，不用翻
         _ensure_english_steps(steps, db)
@@ -856,6 +1084,7 @@ def get_video_steps(
         video,
         steps,
         record,
+        progress=progress,
         analyzing=_is_analyzing(video_id) or _needs_analysis(video, record),
         waiting=False,
         lang=lang,
@@ -867,6 +1096,7 @@ def regenerate_video_steps(
     video_id: str,
     force: bool = Query(default=False),
     lang: str = Query(default="zh"),
+    user_id: str = Depends(current_user_id),
     db: Session = Depends(get_db),
 ):
     """重新拆一次。
@@ -876,15 +1106,30 @@ def regenerate_video_steps(
     有进度又没带 force 的话，先告诉调用方会丢什么，别让它悄悄清掉。
     """
     video = _load_video(video_id, db, lang)
+    _require_user_tutorial(user_id, video_id, db)
     if _local_video_path(video) is None:
         raise HTTPException(status_code=409, detail=msg("error.cannot_regen_not_local", lang))
 
     steps = _ordered_steps(video_id, db)
-    done_count = sum(1 for step in steps if step.done)
+    progress = _progress_map(user_id, steps, db)
+    done_count = sum(1 for item in progress.values() if item.done)
     if done_count and not force:
         raise HTTPException(
             status_code=409,
             detail=msg("error.regen_would_reset", lang).format(done=done_count),
+        )
+
+    linked_users = db.scalar(
+        select(func.count(UserTutorial.id)).where(UserTutorial.video_id == video_id)
+    ) or 0
+    if linked_users > 1:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "这份教程正在被多位用户使用，不能直接重拆共享步骤。"
+                if normalize(lang) == "zh"
+                else "This shared tutorial is used by multiple people and cannot be regenerated in place."
+            ),
         )
 
     # 后台跑，别把请求挂在这里等半分钟；前端拿到 analyzing=true 会自己轮询
@@ -893,9 +1138,18 @@ def regenerate_video_steps(
     video = _load_video(video_id, db, lang)
     steps = _ordered_steps(video_id, db)
     record = _latest_breakdown(video_id, db)
+    progress = _progress_map(user_id, steps, db)
     if normalize(lang) == "en" and steps and (record is None or record.lang == "zh"):
         _ensure_english_steps(steps, db)
-    return _steps_response(video, steps, record, analyzing=True, waiting=False, lang=lang)
+    return _steps_response(
+        video,
+        steps,
+        record,
+        progress=progress,
+        analyzing=True,
+        waiting=False,
+        lang=lang,
+    )
 
 
 @app.get("/api/videos/{video_id}/steps/{step_id}/frame")
@@ -903,12 +1157,14 @@ def get_step_frame(
     video_id: str,
     step_id: str,
     lang: str = Query(default="zh"),
+    user_id: str = Depends(current_user_id),
 ):
     """这一步的代表画面。没有就如实 404，不要拿别的图糊弄。"""
     # 同样是流式响应：步骤页会一次性拉很多张帧，读完后立刻关会话，
     # 别把连接留到图片传完（原因见 get_video_content）。
     with session_scope() as db:
         _load_video(video_id, db, lang)
+        _require_user_tutorial(user_id, video_id, db)
         step = _load_step(video_id, step_id, db, lang)
         frame_key = step.frame_key
     if not frame_key:
@@ -932,26 +1188,29 @@ def update_step(
     step_id: str,
     payload: StepUpdate,
     lang: str = Query(default="zh"),
+    user_id: str = Depends(current_user_id),
     db: Session = Depends(get_db),
 ):
     """用户自己勾「我做到了」/ 撤销，或者留一句备注。"""
     _load_video(video_id, db, lang)
+    _require_user_tutorial(user_id, video_id, db)
     step = _load_step(video_id, step_id, db, lang)
+    progress = _get_or_create_progress(user_id, step, db)
 
-    if payload.done is not None and payload.done != step.done:
-        step.done = payload.done
-        step.done_at = utcnow() if payload.done else None
+    if payload.done is not None and payload.done != progress.done:
+        progress.done = payload.done
+        progress.done_at = utcnow() if payload.done else None
         if not payload.done:
             # 撤销时把上一次判定一起清掉，免得出现「没做到但判定是通过」
-            step.last_verdict = None
-            step.last_reason = None
-            step.last_checked_at = None
+            progress.last_verdict = None
+            progress.last_reason = None
+            progress.last_checked_at = None
     if payload.user_note is not None:
-        step.user_note = payload.user_note.strip() or None
+        progress.user_note = payload.user_note.strip() or None
 
     db.commit()
-    db.refresh(step)
-    return _step_read(step, lang)
+    db.refresh(progress)
+    return _step_read(step, progress, lang)
 
 
 @app.post("/api/videos/{video_id}/steps/{step_id}/check", response_model=StepCheckResponse)
@@ -960,24 +1219,28 @@ def check_video_step(
     step_id: str,
     payload: StepCheckRequest,
     lang: str = Query(default="zh"),
+    user_id: str = Depends(current_user_id),
     db: Session = Depends(get_db),
 ):
     """「让小慢帮我看看」：按这一步的合格标准判定过没过。判定通过就自动记成做到了。"""
     video = _load_video(video_id, db, lang)
+    _require_user_tutorial(user_id, video_id, db)
     step = _load_step(video_id, step_id, db, lang)
+    progress = _get_or_create_progress(user_id, step, db)
     image = _validate_image(payload.image_data_url, lang)
 
     outcome = check_step(step, payload.report.strip(), image, lang=lang)
 
-    step.last_verdict = outcome.verdict
-    step.last_reason = outcome.reason
-    step.last_checked_at = utcnow()
+    progress.last_verdict = outcome.verdict
+    progress.last_reason = outcome.reason
+    progress.last_checked_at = utcnow()
     if outcome.verdict == "pass":
-        step.done = True
-        step.done_at = utcnow()
+        progress.done = True
+        progress.done_at = utcnow()
 
     db.add(
         StepInteraction(
+            user_id=user_id,
             video_id=video.id,
             step_id=step.id,
             kind="check",
@@ -991,7 +1254,7 @@ def check_video_step(
         )
     )
     db.commit()
-    db.refresh(step)
+    db.refresh(progress)
 
     return StepCheckResponse(
         verdict=outcome.verdict,
@@ -1000,7 +1263,7 @@ def check_video_step(
         basis=outcome.basis,
         note=outcome.note,
         model_name=outcome.model_name,
-        step=StepRead.model_validate(step),
+        step=_step_read(step, progress, lang),
     )
 
 
@@ -1010,16 +1273,19 @@ def ask_video_step(
     step_id: str,
     payload: StepAskRequest,
     lang: str = Query(default="zh"),
+    user_id: str = Depends(current_user_id),
     db: Session = Depends(get_db),
 ):
     """卡住了问一句。"""
     video = _load_video(video_id, db, lang)
+    _require_user_tutorial(user_id, video_id, db)
     step = _load_step(video_id, step_id, db, lang)
 
     outcome = ask_step(step, payload.question.strip(), lang=lang)
 
     db.add(
         StepInteraction(
+            user_id=user_id,
             video_id=video.id,
             step_id=step.id,
             kind="ask",
