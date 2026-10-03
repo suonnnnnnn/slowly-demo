@@ -40,7 +40,7 @@ async function searchYoutubeForChat(messages, options = {}) {
   const backendUrl = (options.backendUrl || process.env.VIDEO_BACKEND_URL || DEFAULT_BACKEND_URL).replace(/\/$/, "");
   try {
     const response = await fetch(`${backendUrl}/api/search?q=${encodeURIComponent(query)}`, {
-      headers: { Accept: "application/json", Cookie: options.cookie || "" },
+      headers: { Accept: "application/json" },
       signal: AbortSignal.timeout(options.timeoutMs || 12_000),
     });
     const data = await response.json();

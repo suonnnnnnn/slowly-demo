@@ -35,7 +35,6 @@ if settings.database_url.startswith("sqlite"):
     @event.listens_for(engine, "connect")
     def configure_sqlite(dbapi_connection, _):
         cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
         cursor.execute("PRAGMA journal_mode=WAL")
         cursor.execute("PRAGMA busy_timeout=30000")
         cursor.close()
@@ -56,14 +55,12 @@ _SQLITE_COLUMNS: dict[str, dict[str, str]] = {
         "en_hint": "TEXT",
     },
     "videos": {
+        "saved_at": "TIMESTAMP",
         "library_category": "VARCHAR(16)",
         "library_category_basis": "VARCHAR(16)",
     },
     "tutorial_breakdowns": {
         "lang": "VARCHAR(8) NOT NULL DEFAULT 'zh'",
-    },
-    "step_interactions": {
-        "user_id": "VARCHAR(36)",
     },
 }
 
@@ -91,10 +88,6 @@ def create_tables() -> None:
                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_video_platform_source_id "
                 "ON videos (source_platform, source_video_id) "
                 "WHERE source_video_id IS NOT NULL"
-            ))
-            connection.execute(text(
-                "CREATE INDEX IF NOT EXISTS ix_step_interactions_user_id "
-                "ON step_interactions (user_id)"
             ))
 
 
